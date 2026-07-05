@@ -6,12 +6,13 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.db.models import Meeting, Chunk
+from app.db.models import Meeting, Chunk, Participant, Task, Decision
 from app.schemas.meeting import MeetingCreate
 from app.services.extraction import extract_text
 from app.services.chunking import chunk_document, detect_source_type
 from app.services.embeddings import get_embeddings
 from app.services.faiss_store import get_faiss_store
+from app.services.structured_extraction import extract_structured_info
 
 router = APIRouter(prefix="/meetings", tags=["Meetings"])
 
@@ -27,11 +28,18 @@ def create_meeting(meeting: MeetingCreate, db: Session = Depends(get_db)):
     new_meeting = Meeting(
         title=meeting.title,
         project=meeting.project,
+        agenda=meeting.agenda,
     )
 
     db.add(new_meeting)
     db.commit()
     db.refresh(new_meeting)
+
+    for name in meeting.participants:
+        name = name.strip()
+        if name:
+            db.add(Participant(meeting_id=new_meeting.id, person_name=name))
+    db.commit()
 
     return {
         "message": "Meeting created successfully",
@@ -75,6 +83,27 @@ def delete_meeting(meeting_id: int, db: Session = Depends(get_db)):
     db.commit()
 
     return {"message": "Meeting deleted successfully"}
+
+
+# -----------------------------
+# Tasks / Decisions / Participants
+# -----------------------------
+@router.get("/tasks/all")
+def list_tasks(owner: str = None, db: Session = Depends(get_db)):
+    query = db.query(Task)
+    if owner:
+        query = query.filter(Task.owner.ilike(f"%{owner}%"))
+    return query.all()
+
+
+@router.get("/decisions/all")
+def list_decisions(db: Session = Depends(get_db)):
+    return db.query(Decision).all()
+
+
+@router.get("/{meeting_id}/participants")
+def get_participants(meeting_id: int, db: Session = Depends(get_db)):
+    return db.query(Participant).filter(Participant.meeting_id == meeting_id).all()
 
 
 # -----------------------------
@@ -146,6 +175,36 @@ async def upload_transcript(
     store = get_faiss_store()
     store.add(chunk_ids, vectors)
 
+    # --- structured extraction: summary, decisions, tasks ---
+    # Runs on the whole meeting's text, not per-chunk, so it isn't
+    # confused by decisions/tasks that span a chunk boundary.
+    # Best-effort: if it fails or no Groq key is set, the rest of the
+    # pipeline (chat/retrieval) still works fine without it.
+    extracted = extract_structured_info(raw_text)
+    meeting.summary = extracted["summary"] or None
+
+    # naive mapping: attach every extracted item to the FIRST chunk,
+    # since we don't yet trace which chunk a specific sentence came
+    # from. Good enough for MVP traceability; a future improvement
+    # would match each item back to its originating chunk directly.
+    first_chunk_id = chunk_rows[0].id if chunk_rows else None
+
+    for decision_text in extracted["decisions"]:
+        db.add(Decision(
+            meeting_id=meeting.id,
+            decision=decision_text,
+            source_chunk_id=first_chunk_id,
+        ))
+
+    for task_item in extracted["tasks"]:
+        db.add(Task(
+            meeting_id=meeting.id,
+            owner=task_item.get("owner"),
+            task=task_item.get("task", ""),
+            deadline=task_item.get("deadline"),
+            source_chunk_id=first_chunk_id,
+        ))
+
     meeting.source_type = detected_type
     meeting.status = "ready"
     db.commit()
@@ -155,4 +214,6 @@ async def upload_transcript(
         "file": filename,
         "source_type": detected_type,
         "chunks_created": len(chunk_results),
+        "decisions_found": len(extracted["decisions"]),
+        "tasks_found": len(extracted["tasks"]),
     }
