@@ -1,5 +1,6 @@
 import os
 import shutil
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -9,7 +10,7 @@ from app.db.database import get_db
 from app.db.models import Meeting, Chunk, Participant, Task, Decision
 from app.schemas.meeting import MeetingCreate
 from app.services.extraction import extract_text
-from app.services.chunking import chunk_document, detect_source_type
+from app.services.chunking import chunk_document, detect_source_type, detect_speakers
 from app.services.embeddings import get_embeddings
 from app.services.faiss_store import get_faiss_store
 from app.services.structured_extraction import extract_structured_info
@@ -52,7 +53,7 @@ def create_meeting(meeting: MeetingCreate, db: Session = Depends(get_db)):
 # -----------------------------
 @router.get("/")
 def get_meetings(db: Session = Depends(get_db)):
-    meetings = db.query(Meeting).all()
+    meetings = db.query(Meeting).order_by(Meeting.id.desc()).all()
     return meetings
 
 
@@ -123,8 +124,29 @@ async def upload_transcript(
     filename = f"{meeting_id}_{file.filename}"
     filepath = os.path.join(UPLOAD_FOLDER, filename)
 
-    with open(filepath, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # OneDrive can briefly lock a newly-written file while syncing,
+    # causing an intermittent PermissionError that has nothing to do
+    # with the code itself. Retry a few times before giving up.
+    file_bytes = file.file.read()
+    last_error = None
+    for attempt in range(3):
+        try:
+            with open(filepath, "wb") as buffer:
+                buffer.write(file_bytes)
+            last_error = None
+            break
+        except PermissionError as e:
+            last_error = e
+            time.sleep(0.5)
+
+    if last_error is not None:
+        meeting.status = "failed"
+        db.commit()
+        raise HTTPException(
+            500,
+            f"Could not write file after retries (likely OneDrive sync lock): {last_error}. "
+            "Try pausing OneDrive sync or moving the project outside OneDrive.",
+        )
 
     meeting.transcript_path = filepath
     meeting.status = "processing"
@@ -174,6 +196,21 @@ async def upload_transcript(
     chunk_ids = [r.id for r in chunk_rows]
     store = get_faiss_store()
     store.add(chunk_ids, vectors)
+
+    # --- auto-populate participants from detected speakers ---
+    # Free — reuses the same real-speaker detection already computed
+    # during chunking, no extra Groq call. Skips names that were
+    # already added manually at meeting-creation time, so re-uploading
+    # doesn't create duplicate rows for the same person.
+    if detected_type == "transcript":
+        detected_speakers = detect_speakers(raw_text)
+        existing_names = {
+            p.person_name for p in
+            db.query(Participant).filter(Participant.meeting_id == meeting.id).all()
+        }
+        for name in detected_speakers - existing_names:
+            db.add(Participant(meeting_id=meeting.id, person_name=name))
+        db.commit()
 
     # --- structured extraction: summary, decisions, tasks ---
     # Runs on the whole meeting's text, not per-chunk, so it isn't

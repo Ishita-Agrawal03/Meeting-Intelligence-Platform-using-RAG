@@ -1,4 +1,5 @@
 import json
+import re
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -14,12 +15,38 @@ router = APIRouter(tags=["Chat"])
 TOP_K = 5
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
+# Words that typically signal a question depends on prior context
+# ("it", "that", "they") rather than standing alone. Not exhaustive —
+# this is a cheap first-pass filter, not a real classifier.
+FOLLOW_UP_SIGNAL_WORDS = {
+    "it", "that", "this", "they", "them", "those", "these",
+    "he", "she", "him", "her", "further", "also", "too", "again",
+}
+
+
+def _looks_like_follow_up(query: str) -> bool:
+    """Cheap heuristic: does this question contain a pronoun or
+    reference word that likely points back at something earlier in
+    the conversation? Short questions (<=4 words) are also treated as
+    likely follow-ups, since standalone questions are rarely that
+    terse ("what about deadlines?" vs "what deadlines were set for
+    the authentication rework in the sprint planning meeting?")."""
+    words = re.findall(r"[a-zA-Z']+", query.lower())
+    if len(words) <= 4:
+        return True
+    return any(w in FOLLOW_UP_SIGNAL_WORDS for w in words)
+
 
 def _rewrite_query_with_history(query: str, history: list[ChatTurn]) -> str:
     """Turns a follow-up question into a standalone one using recent
-    history. Falls back to the raw query if there's no history or no
-    Groq key configured."""
+    history. Skips the Groq call entirely when there's no history, no
+    Groq key, or the question doesn't look like it depends on prior
+    context — avoiding an unnecessary API call on every single message
+    once a conversation has more than one turn."""
     if not history or not settings.groq_api_key:
+        return query
+
+    if not _looks_like_follow_up(query):
         return query
 
     from groq import Groq
@@ -30,7 +57,9 @@ def _rewrite_query_with_history(query: str, history: list[ChatTurn]) -> str:
     prompt = (
         "Given this recent conversation, rewrite the final user question as a "
         "standalone question that doesn't depend on prior context. "
-        "Return ONLY the rewritten question, nothing else.\n\n"
+        "If the question is already standalone, return it unchanged. "
+        "Return ONLY the rewritten question, nothing else — no preamble, "
+        "no quotes, no explanation.\n\n"
         f"{transcript}\nuser: {query}"
     )
     try:

@@ -10,7 +10,7 @@ same way curl or /docs does. That means:
 
 Run:
     (in one terminal) uvicorn app.main:app --reload
-    (in a second terminal) streamlit run streamlit_app.py
+    (in a second terminal) python -m streamlit run streamlit_app.py
 """
 import requests
 import streamlit as st
@@ -65,6 +65,7 @@ with st.sidebar:
                 result = api_post("/meetings/", json_body={"title": new_title, "project": new_project})
                 if result:
                     st.success(f"Created meeting id={result.get('id')}")
+                    st.session_state["just_created_meeting_id"] = result.get("id")
                     st.rerun()
             else:
                 st.warning("Title is required.")
@@ -74,7 +75,20 @@ with st.sidebar:
     st.subheader("Upload a transcript")
     if meetings:
         meeting_options = {f"{m['id']} — {m['title']}": m["id"] for m in meetings}
-        selected_label = st.selectbox("Choose a meeting", list(meeting_options.keys()))
+        labels = list(meeting_options.keys())
+
+        # If a meeting was just created, default the dropdown to it —
+        # otherwise a file can silently get uploaded to whatever meeting
+        # was previously selected instead of the new one.
+        default_index = 0
+        just_created_id = st.session_state.get("just_created_meeting_id")
+        if just_created_id is not None:
+            for i, label in enumerate(labels):
+                if meeting_options[label] == just_created_id:
+                    default_index = i
+                    break
+
+        selected_label = st.selectbox("Choose a meeting", labels, index=default_index)
         selected_id = meeting_options[selected_label]
 
         uploaded_file = st.file_uploader("Transcript file (.txt, .pdf, .docx)", type=["txt", "pdf", "docx"])
@@ -95,37 +109,124 @@ with st.sidebar:
         st.caption(f"**{m['title']}** (id={m['id']}) — status: `{m.get('status')}`")
 
 
-# ---------------- Main area: chat ----------------
-st.header("💬 Ask about your meetings")
+# ---------------- Main area ----------------
+meetings_by_id = {m["id"]: m for m in meetings}
 
-for turn in st.session_state.chat_history:
-    with st.chat_message(turn["role"]):
-        st.write(turn["content"])
+tab_chat, tab_tasks, tab_decisions, tab_participants = st.tabs(
+    ["💬 Chat", "✅ Tasks", "📌 Decisions", "👥 Participants"]
+)
 
-query = st.chat_input("Ask something, e.g. 'Why did we choose PostgreSQL?'")
+# ---------------- Tab: Chat ----------------
+with tab_chat:
+    st.header("Ask about your meetings")
 
-if query:
-    st.session_state.chat_history.append({"role": "user", "content": query})
-    with st.chat_message("user"):
-        st.write(query)
+    for turn in st.session_state.chat_history:
+        with st.chat_message(turn["role"]):
+            st.write(turn["content"])
 
-    # send recent history (excluding the message we just added, which is `query` itself)
-    history_payload = [
-        {"role": t["role"], "content": t["content"]}
-        for t in st.session_state.chat_history[:-1]
-    ]
+    query = st.chat_input("Ask something, e.g. 'Why did we choose PostgreSQL?'")
 
-    with st.chat_message("assistant"):
-        with st.spinner("Searching meetings..."):
-            result = api_post("/chat", json_body={"query": query, "chat_history": history_payload})
+    if query:
+        st.session_state.chat_history.append({"role": "user", "content": query})
+        with st.chat_message("user"):
+            st.write(query)
 
-        if result:
-            st.write(result["answer"])
+        # send recent history (excluding the message we just added, which is `query` itself)
+        history_payload = [
+            {"role": t["role"], "content": t["content"]}
+            for t in st.session_state.chat_history[:-1]
+        ]
 
-            if result.get("citations"):
-                with st.expander(f"📎 Sources ({len(result['citations'])})"):
-                    for c in result["citations"]:
-                        st.markdown(f"**{c['meeting_title']}** (chunk {c['chunk_id']})")
-                        st.caption(c["source_text"])
+        with st.chat_message("assistant"):
+            with st.spinner("Searching meetings..."):
+                result = api_post("/chat", json_body={"query": query, "chat_history": history_payload})
 
-            st.session_state.chat_history.append({"role": "assistant", "content": result["answer"]})
+            if result:
+                st.write(result["answer"])
+
+                if result.get("citations"):
+                    with st.expander(f"📎 Sources ({len(result['citations'])})"):
+                        for c in result["citations"]:
+                            st.markdown(f"**{c['meeting_title']}** (chunk {c['chunk_id']})")
+                            st.caption(c["source_text"])
+
+                st.session_state.chat_history.append({"role": "assistant", "content": result["answer"]})
+
+# ---------------- Tab: Tasks ----------------
+with tab_tasks:
+    st.header("Action items across all meetings")
+    st.caption("Extracted automatically at upload time — no search involved, this is a direct database lookup.")
+
+    owner_filter = st.text_input("Filter by owner (optional)", key="task_owner_filter", placeholder="e.g. Rahul")
+
+    if st.button("Refresh tasks"):
+        st.rerun()
+
+    params = f"?owner={owner_filter}" if owner_filter.strip() else ""
+    tasks = api_get(f"/meetings/tasks/all{params}") or []
+
+    if not tasks:
+        st.info(
+            "No tasks found"
+            + (f" for owner '{owner_filter}'." if owner_filter.strip() else " yet. Upload a meeting to extract some.")
+        )
+    else:
+        for t in tasks:
+            meeting_title = meetings_by_id.get(t["meeting_id"], {}).get("title", f"Meeting {t['meeting_id']}")
+            with st.container(border=True):
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.markdown(f"**{t['task']}**")
+                    st.caption(f"Owner: {t.get('owner') or 'Unassigned'} · From: {meeting_title}")
+                with col2:
+                    if t.get("deadline"):
+                        st.caption(f"📅 {t['deadline']}")
+                    st.caption(f"Status: `{t.get('status', 'pending')}`")
+
+# ---------------- Tab: Decisions ----------------
+with tab_decisions:
+    st.header("Decisions across all meetings")
+    st.caption("Extracted automatically at upload time — no search involved, this is a direct database lookup.")
+
+    if st.button("Refresh decisions"):
+        st.rerun()
+
+    decisions = api_get("/meetings/decisions/all") or []
+
+    if not decisions:
+        st.info("No decisions found yet. Upload a meeting to extract some.")
+    else:
+        # group by meeting so decisions from the same meeting sit together
+        by_meeting = {}
+        for d in decisions:
+            by_meeting.setdefault(d["meeting_id"], []).append(d)
+
+        for meeting_id, meeting_decisions in by_meeting.items():
+            meeting_title = meetings_by_id.get(meeting_id, {}).get("title", f"Meeting {meeting_id}")
+            st.subheader(meeting_title)
+            for d in meeting_decisions:
+                st.markdown(f"- {d['decision']}")
+            st.divider()
+
+# ---------------- Tab: Participants ----------------
+with tab_participants:
+    st.header("Participants by meeting")
+
+    if not meetings:
+        st.info("No meetings yet — create one in the sidebar first.")
+    else:
+        meeting_options2 = {f"{m['id']} — {m['title']}": m["id"] for m in meetings}
+        selected_label2 = st.selectbox(
+            "Choose a meeting", list(meeting_options2.keys()), key="participants_meeting_select"
+        )
+        selected_meeting_id = meeting_options2[selected_label2]
+
+        participants = api_get(f"/meetings/{selected_meeting_id}/participants") or []
+
+        if not participants:
+            st.info("No participants recorded for this meeting.")
+        else:
+            cols = st.columns(3)
+            for i, p in enumerate(participants):
+                with cols[i % 3]:
+                    st.markdown(f"👤 **{p['person_name']}**")
