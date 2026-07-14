@@ -3,10 +3,10 @@ import shutil
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
-from app.db.database import get_db
+from app.db.database import get_db, SessionLocal
 from app.db.models import Meeting, Chunk, Participant, Task, Decision
 from app.schemas.meeting import MeetingCreate
 from app.services.extraction import extract_text
@@ -14,11 +14,213 @@ from app.services.chunking import chunk_document, detect_source_type, detect_spe
 from app.services.embeddings import get_embeddings
 from app.services.faiss_store import get_faiss_store
 from app.services.structured_extraction import extract_structured_info
+from app.services.transcription import transcribe_audio
 
 router = APIRouter(prefix="/meetings", tags=["Meetings"])
 
+AUDIO_VIDEO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mpga", ".mpeg", ".mp4", ".webm"}
+
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+def _background_process_audio(meeting_id: int, filepath: str):
+    """Runs transcription + the full indexing pipeline in the background,
+    using its OWN database session — the request's session is already
+    closed by the time this runs, since the HTTP response was already
+    sent back before this function starts.
+
+    KNOWN LIMITATION: Whisper transcription has no speaker labels, so
+    detect_source_type() will classify this as "notes", not
+    "transcript" — participants won't auto-populate for audio/video
+    uploads. Add participants manually at meeting creation instead.
+
+    Deliberately separate from the synchronous text/pdf/docx path in
+    upload_transcript() rather than sharing code with it — this keeps
+    the already-verified, eval-tested synchronous path completely
+    untouched, at the cost of some duplication."""
+    db = SessionLocal()
+    try:
+        meeting = db.query(Meeting).filter(Meeting.id == meeting_id).first()
+        if meeting is None:
+            return
+
+        meeting.status = "processing"
+        db.commit()
+
+        raw_text = transcribe_audio(Path(filepath))
+        if not raw_text.strip():
+            meeting.status = "failed"
+            db.commit()
+            return
+
+        detected_type = detect_source_type(raw_text)
+        chunk_results = chunk_document(raw_text, source_type=detected_type)
+        if not chunk_results:
+            meeting.status = "failed"
+            db.commit()
+            return
+
+        chunk_rows = []
+        for cr in chunk_results:
+            row = Chunk(
+                meeting_id=meeting.id,
+                chunk_text=cr.text,
+                chunk_type=cr.chunk_type,
+                speakers=cr.speakers,
+                position=cr.position,
+            )
+            db.add(row)
+            chunk_rows.append(row)
+        db.commit()
+        for row in chunk_rows:
+            db.refresh(row)
+
+        vectors = get_embeddings([r.chunk_text for r in chunk_rows])
+        chunk_ids = [r.id for r in chunk_rows]
+        store = get_faiss_store()
+        store.add(chunk_ids, vectors)
+
+        # Speaker auto-detection only applies to "transcript"-type text;
+        # Whisper output has no speaker labels so this branch normally
+        # won't fire for audio/video — participants must be added
+        # manually at meeting creation for these uploads.
+        if detected_type == "transcript":
+            detected_speakers = detect_speakers(raw_text)
+            existing_names = {
+                p.person_name for p in
+                db.query(Participant).filter(Participant.meeting_id == meeting.id).all()
+            }
+            for name in detected_speakers - existing_names:
+                db.add(Participant(meeting_id=meeting.id, person_name=name))
+            db.commit()
+
+        extracted = extract_structured_info(raw_text)
+        meeting.summary = extracted["summary"] or None
+        first_chunk_id = chunk_rows[0].id if chunk_rows else None
+
+        for decision_text in extracted["decisions"]:
+            db.add(Decision(meeting_id=meeting.id, decision=decision_text, source_chunk_id=first_chunk_id))
+
+        for task_item in extracted["tasks"]:
+            db.add(Task(
+                meeting_id=meeting.id,
+                owner=task_item.get("owner"),
+                task=task_item.get("task", ""),
+                deadline=task_item.get("deadline"),
+                source_chunk_id=first_chunk_id,
+            ))
+
+        meeting.source_type = detected_type
+        meeting.status = "ready"
+        db.commit()
+
+    except Exception as e:
+        print(f"Background audio processing failed for meeting {meeting_id}: {e}")
+        try:
+            meeting = db.query(Meeting).filter(Meeting.id == meeting_id).first()
+            if meeting:
+                meeting.status = "failed"
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+def _background_process_audio(meeting_id: int, filepath: str):
+    """Runs transcription + the full indexing pipeline in the background,
+    using its OWN database session — the request's session is already
+    closed by the time this runs, since the HTTP response was already
+    sent back before this function starts.
+
+    Deliberately separate from the synchronous text/pdf/docx path in
+    upload_transcript() rather than sharing code with it — this keeps
+    the already-verified, eval-tested synchronous path completely
+    untouched, at the cost of some duplication."""
+    db = SessionLocal()
+    try:
+        meeting = db.query(Meeting).filter(Meeting.id == meeting_id).first()
+        if meeting is None:
+            return
+
+        meeting.status = "processing"
+        db.commit()
+
+        raw_text = transcribe_audio(Path(filepath))
+        if not raw_text.strip():
+            meeting.status = "failed"
+            db.commit()
+            return
+
+        detected_type = detect_source_type(raw_text)
+        chunk_results = chunk_document(raw_text, source_type=detected_type)
+        if not chunk_results:
+            meeting.status = "failed"
+            db.commit()
+            return
+
+        chunk_rows = []
+        for cr in chunk_results:
+            row = Chunk(
+                meeting_id=meeting.id,
+                chunk_text=cr.text,
+                chunk_type=cr.chunk_type,
+                speakers=cr.speakers,
+                position=cr.position,
+            )
+            db.add(row)
+            chunk_rows.append(row)
+        db.commit()
+        for row in chunk_rows:
+            db.refresh(row)
+
+        vectors = get_embeddings([r.chunk_text for r in chunk_rows])
+        chunk_ids = [r.id for r in chunk_rows]
+        store = get_faiss_store()
+        store.add(chunk_ids, vectors)
+
+        if detected_type == "transcript":
+            detected_speakers = detect_speakers(raw_text)
+            existing_names = {
+                p.person_name for p in
+                db.query(Participant).filter(Participant.meeting_id == meeting.id).all()
+            }
+            for name in detected_speakers - existing_names:
+                db.add(Participant(meeting_id=meeting.id, person_name=name))
+            db.commit()
+
+        extracted = extract_structured_info(raw_text)
+        meeting.summary = extracted["summary"] or None
+        first_chunk_id = chunk_rows[0].id if chunk_rows else None
+
+        for decision_text in extracted["decisions"]:
+            db.add(Decision(meeting_id=meeting.id, decision=decision_text, source_chunk_id=first_chunk_id))
+
+        for task_item in extracted["tasks"]:
+            db.add(Task(
+                meeting_id=meeting.id,
+                owner=task_item.get("owner"),
+                task=task_item.get("task", ""),
+                deadline=task_item.get("deadline"),
+                source_chunk_id=first_chunk_id,
+            ))
+
+        meeting.source_type = detected_type
+        meeting.status = "ready"
+        db.commit()
+
+    except Exception as e:
+        print(f"Background audio processing failed for meeting {meeting_id}: {e}")
+        try:
+            meeting = db.query(Meeting).filter(Meeting.id == meeting_id).first()
+            if meeting:
+                meeting.status = "failed"
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
 
 
 # -----------------------------
@@ -113,6 +315,7 @@ def get_participants(meeting_id: int, db: Session = Depends(get_db)):
 @router.post("/{meeting_id}/upload")
 async def upload_transcript(
     meeting_id: int,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
@@ -149,6 +352,27 @@ async def upload_transcript(
         )
 
     meeting.transcript_path = filepath
+
+    # --- audio/video: transcribe + process in the background ---
+    # Transcription can take anywhere from seconds to minutes depending
+    # on file length — too slow to make the caller wait synchronously.
+    # The response returns immediately; poll GET /meetings/{id} for
+    # status ("transcribing" -> "processing" -> "ready"/"failed").
+    suffix = Path(file.filename).suffix.lower()
+    if suffix in AUDIO_VIDEO_EXTENSIONS:
+        meeting.status = "transcribing"
+        db.commit()
+        background_tasks.add_task(_background_process_audio, meeting.id, filepath)
+        return {
+            "message": "Audio/video uploaded — transcription running in the background.",
+            "file": filename,
+            "status": "transcribing",
+            "note": "Poll GET /meetings/{id} for status updates. "
+                    "Participants won't auto-populate for audio/video — "
+                    "Whisper transcription has no speaker labels; add "
+                    "participants manually if needed.",
+        }
+
     meeting.status = "processing"
     db.commit()
 

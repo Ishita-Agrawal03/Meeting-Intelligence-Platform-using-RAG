@@ -60,9 +60,21 @@ with st.sidebar:
     with st.expander("➕ Create a new meeting", expanded=False):
         new_title = st.text_input("Title", key="new_title")
         new_project = st.text_input("Project", key="new_project")
+        new_participants = st.text_input(
+            "Participants (comma-separated, optional)",
+            key="new_participants",
+            placeholder="e.g. Rahul, Ishita",
+            help="For audio/video uploads, Whisper transcription has no speaker "
+                 "labels, so participants won't auto-detect — add them here manually.",
+        )
         if st.button("Create meeting"):
             if new_title.strip():
-                result = api_post("/meetings/", json_body={"title": new_title, "project": new_project})
+                participant_list = [p.strip() for p in new_participants.split(",") if p.strip()]
+                result = api_post("/meetings/", json_body={
+                    "title": new_title,
+                    "project": new_project,
+                    "participants": participant_list,
+                })
                 if result:
                     st.success(f"Created meeting id={result.get('id')}")
                     st.session_state["just_created_meeting_id"] = result.get("id")
@@ -91,15 +103,25 @@ with st.sidebar:
         selected_label = st.selectbox("Choose a meeting", labels, index=default_index)
         selected_id = meeting_options[selected_label]
 
-        uploaded_file = st.file_uploader("Transcript file (.txt, .pdf, .docx)", type=["txt", "pdf", "docx"])
+        uploaded_file = st.file_uploader(
+            "Transcript, notes, or audio/video (.txt, .pdf, .docx, .mp3, .wav, .mp4, .m4a)",
+            type=["txt", "pdf", "docx", "mp3", "wav", "mp4", "m4a", "webm", "mpga", "mpeg"],
+        )
         if uploaded_file and st.button("Upload"):
             files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
             result = api_post(f"/meetings/{selected_id}/upload", files=files)
             if result:
-                st.success(
-                    f"Uploaded — {result.get('chunks_created', 0)} chunk(s) created, "
-                    f"detected as '{result.get('source_type')}'"
-                )
+                if result.get("status") == "transcribing":
+                    st.info(
+                        "🎙️ Audio/video uploaded — transcribing in the background. "
+                        "Check the meeting's status below; it'll move to `ready` once done "
+                        "(refresh or ask a question to see updated status)."
+                    )
+                else:
+                    st.success(
+                        f"Uploaded — {result.get('chunks_created', 0)} chunk(s) created, "
+                        f"detected as '{result.get('source_type')}'"
+                    )
     else:
         st.info("No meetings yet — create one above first.")
 
@@ -120,6 +142,15 @@ tab_chat, tab_tasks, tab_decisions, tab_participants = st.tabs(
 with tab_chat:
     st.header("Ask about your meetings")
 
+    filter_options = {"All meetings (search everything)": None}
+    filter_options.update({f"{m['id']} — {m['title']}": m["id"] for m in meetings})
+    filter_label = st.selectbox(
+        "Search scope", list(filter_options.keys()), key="chat_meeting_filter",
+        help="Restrict this question to one meeting's content — useful for confirming "
+             "a specific upload actually indexed, instead of always searching everything.",
+    )
+    filter_meeting_id = filter_options[filter_label]
+
     for turn in st.session_state.chat_history:
         with st.chat_message(turn["role"]):
             st.write(turn["content"])
@@ -137,20 +168,33 @@ with tab_chat:
             for t in st.session_state.chat_history[:-1]
         ]
 
+        def _token_stream():
+            """Yields plain-text pieces as they arrive from the backend,
+            for st.write_stream to render incrementally instead of
+            waiting for the full answer."""
+            payload = {"query": query, "chat_history": history_payload}
+            if filter_meeting_id is not None:
+                payload["meeting_id"] = filter_meeting_id
+            try:
+                with requests.post(
+                    f"{API_BASE_URL}/chat/stream",
+                    json=payload,
+                    stream=True,
+                    timeout=60,
+                ) as resp:
+                    resp.raise_for_status()
+                    for piece in resp.iter_content(chunk_size=None, decode_unicode=True):
+                        if piece:
+                            yield piece
+            except requests.exceptions.ConnectionError:
+                yield "Can't reach the backend. Is `uvicorn app.main:app --reload` running?"
+            except Exception as e:
+                yield f"Request failed: {e}"
+
         with st.chat_message("assistant"):
-            with st.spinner("Searching meetings..."):
-                result = api_post("/chat", json_body={"query": query, "chat_history": history_payload})
+            full_answer = st.write_stream(_token_stream())
 
-            if result:
-                st.write(result["answer"])
-
-                if result.get("citations"):
-                    with st.expander(f"📎 Sources ({len(result['citations'])})"):
-                        for c in result["citations"]:
-                            st.markdown(f"**{c['meeting_title']}** (chunk {c['chunk_id']})")
-                            st.caption(c["source_text"])
-
-                st.session_state.chat_history.append({"role": "assistant", "content": result["answer"]})
+        st.session_state.chat_history.append({"role": "assistant", "content": full_answer})
 
 # ---------------- Tab: Tasks ----------------
 with tab_tasks:
@@ -215,18 +259,18 @@ with tab_participants:
     if not meetings:
         st.info("No meetings yet — create one in the sidebar first.")
     else:
-        meeting_options2 = {f"{m['id']} — {m['title']}": m["id"] for m in meetings}
-        selected_label2 = st.selectbox(
-            "Choose a meeting", list(meeting_options2.keys()), key="participants_meeting_select"
-        )
-        selected_meeting_id = meeting_options2[selected_label2]
-
-        participants = api_get(f"/meetings/{selected_meeting_id}/participants") or []
-
-        if not participants:
-            st.info("No participants recorded for this meeting.")
-        else:
-            cols = st.columns(3)
+        any_participants = False
+        for m in meetings:
+            participants = api_get(f"/meetings/{m['id']}/participants") or []
+            if not participants:
+                continue
+            any_participants = True
+            st.subheader(m["title"])
+            cols = st.columns(4)
             for i, p in enumerate(participants):
-                with cols[i % 3]:
+                with cols[i % 4]:
                     st.markdown(f"👤 **{p['person_name']}**")
+            st.divider()
+
+        if not any_participants:
+            st.info("No participants recorded yet across any meeting.")

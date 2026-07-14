@@ -1,6 +1,7 @@
 import json
 import re
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -174,4 +175,94 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)):
         answer=result["answer"],
         citations=citations,
         retrieved_chunk_ids=retrieved_ids,  # logged for eval even if not all cited
+    )
+
+
+def _stream_answer_tokens(query: str, chunks: list[Chunk]):
+    """Generator that yields plain-text tokens as Groq produces them.
+
+    NOTE: this trades away the strict cited_chunk_ids JSON constraint
+    used by /chat — JSON can't be usefully streamed token-by-token
+    since it isn't valid until the whole thing arrives. Instead, the
+    model is asked to inline citations as [chunk_id] directly in the
+    streamed text, and is still given only the allowed ids. This is
+    a deliberate simplification for the streaming path; /chat remains
+    the source of truth for strict, parseable citations (and is what
+    the eval harness uses)."""
+    allowed_ids = [c.id for c in chunks]
+
+    if not settings.groq_api_key:
+        yield (
+            "(GROQ_API_KEY not set — configure it in .env to get real answers.) "
+            f"Retrieved {len(chunks)} relevant chunk(s) for: '{query}'"
+        )
+        return
+
+    from groq import Groq
+    client = Groq(api_key=settings.groq_api_key)
+
+    context_blocks = [
+        f"[chunk_id={c.id}] (meeting_id={c.meeting_id})\n{c.chunk_text}"
+        for c in chunks
+    ]
+    context = "\n\n---\n\n".join(context_blocks)
+
+    system_prompt = (
+        "You answer questions about company meetings using ONLY the provided "
+        "meeting excerpts. When you state a fact from an excerpt, cite it "
+        "inline immediately after, like [chunk_id]. Only use chunk_id values "
+        "that appear in the excerpts below — never invent one. If the "
+        "excerpts don't contain the answer, say so explicitly, in plain "
+        "text, no citation needed for that. "
+        f"Allowed chunk_id values: {allowed_ids}"
+    )
+
+    try:
+        stream = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Excerpts:\n{context}\n\nQuestion: {query}"},
+            ],
+            max_tokens=800,
+            stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+    except Exception as e:
+        yield f"\n\n[LLM call failed: {e}]"
+
+
+@router.post("/chat/stream")
+def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
+    """Same retrieval as /chat, but streams the answer back as plain
+    text chunks instead of waiting for the full response. See
+    _stream_answer_tokens for why citations work differently here."""
+    standalone_query = _rewrite_query_with_history(req.query, req.chat_history)
+
+    query_vector = get_embedding(standalone_query)
+    store = get_faiss_store()
+    results = store.search(query_vector, top_k=TOP_K)
+
+    if not results:
+        def _empty():
+            yield "No meetings have been indexed yet."
+        return StreamingResponse(_empty(), media_type="text/plain")
+
+    retrieved_ids = [cid for cid, _ in results]
+    chunks_query = db.query(Chunk).filter(Chunk.id.in_(retrieved_ids))
+    if req.meeting_id is not None:
+        chunks_query = chunks_query.filter(Chunk.meeting_id == req.meeting_id)
+    chunks = chunks_query.all()
+
+    if not chunks:
+        def _none_relevant():
+            yield "No relevant content found for this meeting filter."
+        return StreamingResponse(_none_relevant(), media_type="text/plain")
+
+    return StreamingResponse(
+        _stream_answer_tokens(standalone_query, chunks),
+        media_type="text/plain",
     )
