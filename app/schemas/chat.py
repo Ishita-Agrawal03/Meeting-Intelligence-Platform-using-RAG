@@ -9,7 +9,8 @@ class ChatTurn(BaseModel):
 
 class ChatRequest(BaseModel):
     query: str
-    meeting_id: Optional[int] = None  # optional: restrict to one meeting
+    meeting_id: Optional[int] = None    # restrict to one meeting
+    project_id: Optional[int] = None    # restrict to all meetings in a project
     chat_history: List[ChatTurn] = []
 
 

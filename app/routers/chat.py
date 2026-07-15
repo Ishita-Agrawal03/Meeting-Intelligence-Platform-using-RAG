@@ -14,11 +14,14 @@ from app.config import settings
 router = APIRouter(tags=["Chat"])
 
 TOP_K = 5
+# When a meeting_id/project_id filter is active, FAISS's top-k search
+# still happens globally FIRST, then results get filtered down — so a
+# small project's relevant chunks could get crowded out by unrelated
+# projects before filtering ever runs. Fetch a wider candidate pool
+# whenever a filter is active, then cap at TOP_K after filtering.
+TOP_K_WHEN_FILTERED = 25
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# Words that typically signal a question depends on prior context
-# ("it", "that", "they") rather than standing alone. Not exhaustive —
-# this is a cheap first-pass filter, not a real classifier.
 FOLLOW_UP_SIGNAL_WORDS = {
     "it", "that", "this", "they", "them", "those", "these",
     "he", "she", "him", "her", "further", "also", "too", "again",
@@ -26,12 +29,6 @@ FOLLOW_UP_SIGNAL_WORDS = {
 
 
 def _looks_like_follow_up(query: str) -> bool:
-    """Cheap heuristic: does this question contain a pronoun or
-    reference word that likely points back at something earlier in
-    the conversation? Short questions (<=4 words) are also treated as
-    likely follow-ups, since standalone questions are rarely that
-    terse ("what about deadlines?" vs "what deadlines were set for
-    the authentication rework in the sprint planning meeting?")."""
     words = re.findall(r"[a-zA-Z']+", query.lower())
     if len(words) <= 4:
         return True
@@ -39,14 +36,8 @@ def _looks_like_follow_up(query: str) -> bool:
 
 
 def _rewrite_query_with_history(query: str, history: list[ChatTurn]) -> str:
-    """Turns a follow-up question into a standalone one using recent
-    history. Skips the Groq call entirely when there's no history, no
-    Groq key, or the question doesn't look like it depends on prior
-    context — avoiding an unnecessary API call on every single message
-    once a conversation has more than one turn."""
     if not history or not settings.groq_api_key:
         return query
-
     if not _looks_like_follow_up(query):
         return query
 
@@ -75,9 +66,42 @@ def _rewrite_query_with_history(query: str, history: list[ChatTurn]) -> str:
         return query
 
 
+def _retrieve_chunks(db: Session, query: str, meeting_id: int = None, project_id: int = None):
+    """Shared retrieval logic used by both /chat and /chat/stream.
+    Returns (chunks, retrieved_ids). Widens the FAISS candidate pool
+    whenever a filter is active, since filtering happens AFTER the
+    vector search, not before."""
+    is_filtered = meeting_id is not None or project_id is not None
+    top_k = TOP_K_WHEN_FILTERED if is_filtered else TOP_K
+
+    query_vector = get_embedding(query)
+    store = get_faiss_store()
+    results = store.search(query_vector, top_k=top_k)
+
+    if not results:
+        return [], []
+
+    retrieved_ids = [cid for cid, _ in results]
+    chunks_query = db.query(Chunk).filter(Chunk.id.in_(retrieved_ids))
+
+    if meeting_id is not None:
+        chunks_query = chunks_query.filter(Chunk.meeting_id == meeting_id)
+    elif project_id is not None:
+        chunks_query = chunks_query.join(Meeting, Chunk.meeting_id == Meeting.id).filter(
+            Meeting.project_id == project_id
+        )
+
+    chunks = chunks_query.all()
+
+    # Preserve FAISS's relevance order, then cap at TOP_K even though
+    # we fetched a wider pool — the wider pool was only to survive
+    # filtering, not to send more context to the LLM than necessary.
+    chunks_by_id = {c.id: c for c in chunks}
+    ordered = [chunks_by_id[cid] for cid in retrieved_ids if cid in chunks_by_id][:TOP_K]
+    return ordered, retrieved_ids
+
+
 def _generate_answer(query: str, chunks: list[Chunk]) -> dict:
-    """Calls Groq with retrieved chunks, constraining citations to
-    chunk ids that were actually retrieved — the LLM cannot invent one."""
     allowed_ids = [c.id for c in chunks]
 
     if not settings.groq_api_key:
@@ -124,34 +148,18 @@ def _generate_answer(query: str, chunks: list[Chunk]) -> dict:
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, db: Session = Depends(get_db)):
-    # --- Step 11: retrieval ---
     standalone_query = _rewrite_query_with_history(req.query, req.chat_history)
+    chunks, retrieved_ids = _retrieve_chunks(db, standalone_query, req.meeting_id, req.project_id)
 
-    query_vector = get_embedding(standalone_query)
-    store = get_faiss_store()
-    results = store.search(query_vector, top_k=TOP_K)  # [(chunk_id, distance), ...]
-
-    if not results:
-        return ChatResponse(
-            answer="No meetings have been indexed yet.",
-            citations=[],
-            retrieved_chunk_ids=[],
-        )
-
-    retrieved_ids = [cid for cid, _ in results]
-    chunks_query = db.query(Chunk).filter(Chunk.id.in_(retrieved_ids))
-    if req.meeting_id is not None:
-        chunks_query = chunks_query.filter(Chunk.meeting_id == req.meeting_id)
-    chunks = chunks_query.all()
-
+    if not retrieved_ids:
+        return ChatResponse(answer="No meetings have been indexed yet.", citations=[], retrieved_chunk_ids=[])
     if not chunks:
         return ChatResponse(
-            answer="No relevant content found for this meeting filter.",
+            answer="No relevant content found for this filter.",
             citations=[],
             retrieved_chunk_ids=retrieved_ids,
         )
 
-    # --- Step 12: generation ---
     result = _generate_answer(standalone_query, chunks)
 
     chunks_by_id = {c.id: c for c in chunks}
@@ -171,24 +179,10 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)):
             source_text=c.chunk_text[:300],
         ))
 
-    return ChatResponse(
-        answer=result["answer"],
-        citations=citations,
-        retrieved_chunk_ids=retrieved_ids,  # logged for eval even if not all cited
-    )
+    return ChatResponse(answer=result["answer"], citations=citations, retrieved_chunk_ids=retrieved_ids)
 
 
 def _stream_answer_tokens(query: str, chunks: list[Chunk]):
-    """Generator that yields plain-text tokens as Groq produces them.
-
-    NOTE: this trades away the strict cited_chunk_ids JSON constraint
-    used by /chat — JSON can't be usefully streamed token-by-token
-    since it isn't valid until the whole thing arrives. Instead, the
-    model is asked to inline citations as [chunk_id] directly in the
-    streamed text, and is still given only the allowed ids. This is
-    a deliberate simplification for the streaming path; /chat remains
-    the source of truth for strict, parseable citations (and is what
-    the eval harness uses)."""
     allowed_ids = [c.id for c in chunks]
 
     if not settings.groq_api_key:
@@ -237,32 +231,17 @@ def _stream_answer_tokens(query: str, chunks: list[Chunk]):
 
 @router.post("/chat/stream")
 def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
-    """Same retrieval as /chat, but streams the answer back as plain
-    text chunks instead of waiting for the full response. See
-    _stream_answer_tokens for why citations work differently here."""
     standalone_query = _rewrite_query_with_history(req.query, req.chat_history)
+    chunks, retrieved_ids = _retrieve_chunks(db, standalone_query, req.meeting_id, req.project_id)
 
-    query_vector = get_embedding(standalone_query)
-    store = get_faiss_store()
-    results = store.search(query_vector, top_k=TOP_K)
-
-    if not results:
+    if not retrieved_ids:
         def _empty():
             yield "No meetings have been indexed yet."
         return StreamingResponse(_empty(), media_type="text/plain")
 
-    retrieved_ids = [cid for cid, _ in results]
-    chunks_query = db.query(Chunk).filter(Chunk.id.in_(retrieved_ids))
-    if req.meeting_id is not None:
-        chunks_query = chunks_query.filter(Chunk.meeting_id == req.meeting_id)
-    chunks = chunks_query.all()
-
     if not chunks:
         def _none_relevant():
-            yield "No relevant content found for this meeting filter."
+            yield "No relevant content found for this filter."
         return StreamingResponse(_none_relevant(), media_type="text/plain")
 
-    return StreamingResponse(
-        _stream_answer_tokens(standalone_query, chunks),
-        media_type="text/plain",
-    )
+    return StreamingResponse(_stream_answer_tokens(standalone_query, chunks), media_type="text/plain")

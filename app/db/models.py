@@ -5,12 +5,26 @@ from sqlalchemy.orm import relationship
 from app.db.database import Base
 
 
+class Project(Base):
+    """A project is the top-level container a user navigates via the
+    sidebar — like a chat thread in Claude/ChatGPT. Many meetings can
+    belong to one project; chat/tasks/decisions/participants are all
+    scoped to a project, searching across every meeting inside it."""
+    __tablename__ = "projects"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False, unique=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    meetings = relationship("Meeting", back_populates="project", cascade="all, delete-orphan")
+
+
 class Meeting(Base):
     __tablename__ = "meetings"
 
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, nullable=False)
-    project = Column(String)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
     agenda = Column(String)
     transcript_path = Column(String)
     source_type = Column(String)
@@ -18,6 +32,7 @@ class Meeting(Base):
     summary = Column(String)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    project = relationship("Project", back_populates="meetings")
     chunks = relationship("Chunk", back_populates="meeting", cascade="all, delete-orphan")
     participants = relationship("Participant", back_populates="meeting", cascade="all, delete-orphan")
     tasks = relationship("Task", back_populates="meeting", cascade="all, delete-orphan")
