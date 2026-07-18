@@ -10,7 +10,7 @@ fragmented tasks/decisions from adjacent chunks.
 import json
 from app.config import settings
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 EXTRACTION_SYSTEM_PROMPT = """You are analyzing a meeting transcript or notes document.
 Extract the following, using ONLY information explicitly present in the text —

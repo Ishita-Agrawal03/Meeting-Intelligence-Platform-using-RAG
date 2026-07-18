@@ -20,7 +20,7 @@ TOP_K = 5
 # projects before filtering ever runs. Fetch a wider candidate pool
 # whenever a filter is active, then cap at TOP_K after filtering.
 TOP_K_WHEN_FILTERED = 25
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 FOLLOW_UP_SIGNAL_WORDS = {
     "it", "that", "this", "they", "them", "those", "these",
@@ -176,6 +176,8 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)):
             chunk_id=c.id,
             meeting_id=c.meeting_id,
             meeting_title=m.title if m else "Unknown",
+            project_id=m.project_id if m else -1,
+            project_name=(m.project.name if m and m.project else "Unknown"),
             source_text=c.chunk_text[:300],
         ))
 

@@ -2,63 +2,63 @@
   {
     "question": "Which vector database will be used initially for the project?",
     "expected_answer_contains": "Chroma",
-    "expected_meeting_title": "Sprint Planning"
+    "expected_project_name": "Smart Customer Support AI"
   },
   {
     "question": "What authentication method is being used for user login?",
     "expected_answer_contains": "JWT",
-    "expected_meeting_title": "Sprint Planning"
+    "expected_project_name": "Smart Customer Support AI"
   },
   {
     "question": "Who is responsible for the frontend development?",
     "expected_answer_contains": "Michael",
-    "expected_meeting_title": "Sprint Planning"
+    "expected_project_name": "Smart Customer Support AI"
   },
   {
     "question": "How many PDFs can be uploaded per workspace in the first release?",
     "expected_answer_contains": "20",
-    "expected_meeting_title": "Sprint Planning"
+    "expected_project_name": "Smart Customer Support AI"
   },
   {
     "question": "Which cloud provider will be used for deployment?",
     "expected_answer_contains": "AWS",
-    "expected_meeting_title": "Sprint Planning"
+    "expected_project_name": "Smart Customer Support AI"
   },
   {
     "question": "What language model provider was recommended for generating responses?",
     "expected_answer_contains": "Groq",
-    "expected_meeting_title": "Sprint Planning"
+    "expected_project_name": "Smart Customer Support AI"
   },
   {
     "question": "Who is leading the backend development?",
     "expected_answer_contains": "John",
-    "expected_meeting_title": "Sprint Planning"
+    "expected_project_name": "Smart Customer Support AI"
   },
   {
     "question": "Why did the team decide to use PostgreSQL?",
     "expected_answer_contains": "relational",
-    "expected_meeting_title": "PostgreSQL Architecture Decision"
+    "expected_project_name": "PostgreSQL Architecture Decision"
   },
   {
     "question": "Who is setting up the database migration and by when?",
     "expected_answer_contains": "Friday",
-    "expected_meeting_title": "PostgreSQL Architecture Decision"
+    "expected_project_name": "PostgreSQL Architecture Decision"
   },
   {
     "question": "What did Ishita say about the database choice?",
     "expected_answer_contains": "relational",
-    "expected_meeting_title": "PostgreSQL Architecture Decision"
+    "expected_project_name": "PostgreSQL Architecture Decision"
   },
   {
     "question": "What did the team decide about using Kubernetes for deployment?",
     "expected_answer_contains": "__NO_ANSWER__",
-    "expected_meeting_title": null,
+    "expected_project_name": null,
     "is_adversarial": true
   },
   {
     "question": "What was discussed about the marketing budget for Q4?",
     "expected_answer_contains": "__NO_ANSWER__",
-    "expected_meeting_title": null,
+    "expected_project_name": null,
     "is_adversarial": true
   }
 ]

@@ -1,0 +1,42 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Overrides the .env value specifically for the container, so
+      # SQLite writes into the mounted volume below (persists across
+      # rebuilds) instead of the image's ephemeral filesystem.
+      - DATABASE_URL=sqlite:////app/data/meetings.db
+    volumes:
+      # Named volumes persist data on the HOST disk, independent of the
+      # container's lifecycle — rebuilding or restarting the container
+      # does NOT wipe meetings.db, the FAISS index, or uploaded files.
+      - meetings_data:/app/data
+      - uploads_data:/app/uploads
+      - vector_store_data:/app/vector_store
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    ports:
+      - "8501:8501"
+    environment:
+      # "backend" resolves via Docker's internal DNS to the backend
+      # service above — NOT 127.0.0.1, which would only mean "this
+      # container" and could never reach a sibling container.
+      - API_BASE_URL=http://backend:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  meetings_data:
+  uploads_data:
+  vector_store_data:

@@ -1,0 +1,16 @@
+# Frontend image — runs the Streamlit UI, talks to the backend
+# container over HTTP. Uses its OWN minimal requirements file — it
+# never needs torch/faiss/transformers/etc, since it doesn't do any
+# AI/ML work itself, just calls the backend's API.
+FROM python:3.13-slim
+
+WORKDIR /app
+
+COPY requirements-frontend.txt .
+RUN pip install --no-cache-dir -r requirements-frontend.txt
+
+COPY streamlit_app.py .
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]

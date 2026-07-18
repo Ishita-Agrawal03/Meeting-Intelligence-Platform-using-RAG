@@ -18,6 +18,8 @@ class Citation(BaseModel):
     chunk_id: int
     meeting_id: int
     meeting_title: str
+    project_id: int
+    project_name: str
     source_text: str
 
 
