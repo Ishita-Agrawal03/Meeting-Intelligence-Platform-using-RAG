@@ -57,6 +57,22 @@ def api_post(path, json_body=None, files=None):
         return None
 
 
+def api_delete(path):
+    try:
+        resp = requests.delete(f"{API_BASE_URL}{path}")
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.ConnectionError:
+        st.error("Can't reach the backend. Is `uvicorn app.main:app --reload` running?")
+        return None
+    except requests.exceptions.HTTPError as e:
+        st.error(f"Backend error: {e.response.text}")
+        return None
+    except Exception as e:
+        st.error(f"Request failed: {e}")
+        return None
+
+
 # ==================== SIDEBAR: project navigation ====================
 with st.sidebar:
     st.header("🧠 Projects")
@@ -66,9 +82,38 @@ with st.sidebar:
     for p in projects:
         is_active = p["id"] == st.session_state.active_project_id
         label = f"{'🟢 ' if is_active else ''}{p['name']} ({p['meeting_count']})"
-        if st.button(label, key=f"proj_{p['id']}", use_container_width=True):
-            st.session_state.active_project_id = p["id"]
-            st.rerun()
+
+        col1, col2 = st.columns([5, 1])
+        with col1:
+            if st.button(label, key=f"proj_{p['id']}", use_container_width=True):
+                st.session_state.active_project_id = p["id"]
+                st.rerun()
+        with col2:
+            if st.button("🗑️", key=f"del_{p['id']}", help=f"Delete '{p['name']}'"):
+                st.session_state.confirm_delete_id = p["id"]
+                st.session_state.confirm_delete_name = p["name"]
+                st.rerun()
+
+    # Confirmation step — deleting a project also deletes every meeting,
+    # chunk, task, decision, and participant inside it (cascade). This
+    # is permanent, so a stray click on the trash icon shouldn't be
+    # enough on its own to actually delete anything.
+    if st.session_state.get("confirm_delete_id") is not None:
+        st.warning(f"Delete **{st.session_state.confirm_delete_name}** and everything in it? This can't be undone.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Yes, delete", type="primary", use_container_width=True):
+                api_delete(f"/projects/{st.session_state.confirm_delete_id}")
+                if st.session_state.active_project_id == st.session_state.confirm_delete_id:
+                    st.session_state.active_project_id = None
+                st.session_state.confirm_delete_id = None
+                st.session_state.confirm_delete_name = None
+                st.rerun()
+        with c2:
+            if st.button("Cancel", use_container_width=True):
+                st.session_state.confirm_delete_id = None
+                st.session_state.confirm_delete_name = None
+                st.rerun()
 
     st.divider()
     if st.button("➕ New project", use_container_width=True):
