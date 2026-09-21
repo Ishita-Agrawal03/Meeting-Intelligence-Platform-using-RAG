@@ -14,13 +14,8 @@ from app.config import settings
 router = APIRouter(tags=["Chat"])
 
 TOP_K = 5
-# When a meeting_id/project_id filter is active, FAISS's top-k search
-# still happens globally FIRST, then results get filtered down — so a
-# small project's relevant chunks could get crowded out by unrelated
-# projects before filtering ever runs. Fetch a wider candidate pool
-# whenever a filter is active, then cap at TOP_K after filtering.
 TOP_K_WHEN_FILTERED = 25
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 FOLLOW_UP_SIGNAL_WORDS = {
     "it", "that", "this", "they", "them", "those", "these",
@@ -67,10 +62,6 @@ def _rewrite_query_with_history(query: str, history: list[ChatTurn]) -> str:
 
 
 def _retrieve_chunks(db: Session, query: str, meeting_id: int = None, project_id: int = None):
-    """Shared retrieval logic used by both /chat and /chat/stream.
-    Returns (chunks, retrieved_ids). Widens the FAISS candidate pool
-    whenever a filter is active, since filtering happens AFTER the
-    vector search, not before."""
     is_filtered = meeting_id is not None or project_id is not None
     top_k = TOP_K_WHEN_FILTERED if is_filtered else TOP_K
 
@@ -93,9 +84,6 @@ def _retrieve_chunks(db: Session, query: str, meeting_id: int = None, project_id
 
     chunks = chunks_query.all()
 
-    # Preserve FAISS's relevance order, then cap at TOP_K even though
-    # we fetched a wider pool — the wider pool was only to survive
-    # filtering, not to send more context to the LLM than necessary.
     chunks_by_id = {c.id: c for c in chunks}
     ordered = [chunks_by_id[cid] for cid in retrieved_ids if cid in chunks_by_id][:TOP_K]
     return ordered, retrieved_ids
@@ -170,7 +158,7 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)):
         if not c:
             continue
         if c.meeting_id not in meetings_by_id:
-            meetings_by_id[c.meeting_id] = db.query(Meeting).get(c.meeting_id)
+            meetings_by_id[c.meeting_id] = db.get(Meeting, c.meeting_id)
         m = meetings_by_id[c.meeting_id]
         citations.append(Citation(
             chunk_id=c.id,
@@ -185,6 +173,10 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)):
 
 
 def _stream_answer_tokens(query: str, chunks: list[Chunk]):
+    """Yields RAW plain-text tokens from Groq, as they arrive.
+    Citation validation happens in _sanitize_citation_stream, which
+    wraps this generator — kept separate so this function's only job
+    is talking to Groq, nothing else."""
     allowed_ids = [c.id for c in chunks]
 
     if not settings.groq_api_key:
@@ -231,6 +223,42 @@ def _stream_answer_tokens(query: str, chunks: list[Chunk]):
         yield f"\n\n[LLM call failed: {e}]"
 
 
+CITATION_PATTERN = re.compile(r"\[(\d+)\]")
+
+
+def _sanitize_citation_stream(raw_token_gen, allowed_ids: list[int]):
+    """Wraps a raw token generator and validates every inline [chunk_id]
+    citation against allowed_ids BEFORE it ever reaches the client —
+    fixing the gap where /chat/stream previously yielded raw model
+    output with no citation checking at all, unlike /chat.
+
+    Buffers text and only flushes up to the last point that is NOT
+    inside an unclosed '[' — otherwise a citation like '[42]' could get
+    split across two yields (e.g. '[4' then '2]'), reach the client
+    before we've seen the whole number, and be impossible to strip if
+    invalid. This costs a few characters of latency, not perceptible
+    in practice, in exchange for a real correctness guarantee."""
+    allowed = set(allowed_ids)
+    buffer = ""
+
+    def _validate(match: re.Match) -> str:
+        cid = int(match.group(1))
+        return match.group(0) if cid in allowed else ""
+
+    for delta in raw_token_gen:
+        buffer += delta
+        last_open = buffer.rfind("[")
+        last_close = buffer.rfind("]")
+        safe_end = last_open if last_open > last_close else len(buffer)
+
+        safe_part, buffer = buffer[:safe_end], buffer[safe_end:]
+        if safe_part:
+            yield CITATION_PATTERN.sub(_validate, safe_part)
+
+    if buffer:
+        yield CITATION_PATTERN.sub(_validate, buffer)
+
+
 @router.post("/chat/stream")
 def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
     standalone_query = _rewrite_query_with_history(req.query, req.chat_history)
@@ -246,4 +274,7 @@ def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
             yield "No relevant content found for this filter."
         return StreamingResponse(_none_relevant(), media_type="text/plain")
 
-    return StreamingResponse(_stream_answer_tokens(standalone_query, chunks), media_type="text/plain")
+    allowed_ids = [c.id for c in chunks]
+    raw_stream = _stream_answer_tokens(standalone_query, chunks)
+    validated_stream = _sanitize_citation_stream(raw_stream, allowed_ids)
+    return StreamingResponse(validated_stream, media_type="text/plain")

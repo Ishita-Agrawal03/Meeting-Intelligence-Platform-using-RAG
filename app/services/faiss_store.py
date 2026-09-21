@@ -1,13 +1,12 @@
 """
 FAISS wrapper used by the live app.
 
-Same design proven in scripts/test_faiss.py:
   - IndexIDMap so the id we pass in when adding IS the chunk's
     SQLite id — no separate translation table needed.
   - Saved to disk after every write, so vectors survive a restart.
-
-This is a module-level singleton: the whole app shares one FaissStore
-instance and one underlying index file.
+  - search() and add() both take the lock — a real race existed
+    before this fix: add() was protected, search() was not, so a
+    concurrent upload and chat request could read the index mid-write.
 """
 import threading
 from pathlib import Path
@@ -29,7 +28,20 @@ class FaissStore:
 
     def _load_or_create(self):
         if self.index_path.exists():
-            return faiss.read_index(str(self.index_path))
+            index = faiss.read_index(str(self.index_path))
+            # A stale index built with a different embedding model
+            # (different dimension) would otherwise load silently and
+            # fail much later, confusingly, inside a search() or add()
+            # call far from the real cause. Fail loudly here instead.
+            if index.d != self.dim:
+                raise ValueError(
+                    f"Loaded FAISS index has dimension {index.d}, but the "
+                    f"configured embedding dimension is {self.dim}. The "
+                    f"index on disk was likely built with a different "
+                    f"embedding model. Delete {self.index_path} and "
+                    f"re-upload to rebuild it."
+                )
+            return index
         base = faiss.IndexFlatL2(self.dim)
         return faiss.IndexIDMap(base)
 
@@ -46,10 +58,12 @@ class FaissStore:
 
     def search(self, query_vector: np.ndarray, top_k: int = 5):
         """Returns list of (chunk_id, distance), best match first."""
-        if self.index.ntotal == 0:
-            return []
-        query_vector = query_vector.reshape(1, -1)
-        distances, ids = self.index.search(query_vector, top_k)
+        with self._lock:
+            if self.index.ntotal == 0:
+                return []
+            query_vector = query_vector.reshape(1, -1)
+            distances, ids = self.index.search(query_vector, top_k)
+
         results = []
         for chunk_id, dist in zip(ids[0], distances[0]):
             if chunk_id == -1:

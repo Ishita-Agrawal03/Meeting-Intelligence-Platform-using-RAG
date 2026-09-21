@@ -1,10 +1,6 @@
 """
 Shared processing pipeline — extraction/transcription -> chunking ->
 embedding -> FAISS -> participants -> structured extraction -> status.
-
-Factored out so both the synchronous (text/pdf/docx) and background
-(audio/video) upload paths call the SAME logic instead of maintaining
-two separate copies that could silently drift apart.
 """
 import os
 import time
@@ -27,9 +23,15 @@ AUDIO_VIDEO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mpga", ".mpeg", ".mp4", ".we
 
 def save_uploaded_file(meeting_id: int, filename: str, file_bytes: bytes) -> str:
     """Saves raw upload bytes to disk with retry logic (OneDrive can
-    intermittently lock a newly-written file mid-sync). Returns the
-    filepath, or raises RuntimeError after exhausting retries."""
-    safe_name = f"{meeting_id}_{filename}"
+    intermittently lock a newly-written file mid-sync).
+
+    filename is sanitized via Path(...).name FIRST — stripping any
+    directory components — before being used to build the save path.
+    Without this, a filename containing path separators (e.g.
+    "../../etc/something") could plausibly cause the file to be
+    written outside UPLOAD_FOLDER entirely."""
+    safe_filename = Path(filename).name
+    safe_name = f"{meeting_id}_{safe_filename}"
     filepath = os.path.join(UPLOAD_FOLDER, safe_name)
 
     last_error = None
@@ -48,16 +50,30 @@ def save_uploaded_file(meeting_id: int, filename: str, file_bytes: bytes) -> str
     )
 
 
+def delete_uploaded_file(filepath: str):
+    """Removes the raw uploaded file from disk. Safe to call even if
+    the file is already missing — a meeting record can exist with no
+    file (e.g. failed before upload completed)."""
+    if filepath and os.path.exists(filepath):
+        try:
+            os.remove(filepath)
+        except OSError as e:
+            print(f"Could not delete file {filepath}: {e}")
+
+
 def is_audio_video(filename: str) -> bool:
     return Path(filename).suffix.lower() in AUDIO_VIDEO_EXTENSIONS
 
 
 def process_meeting_text(db: Session, meeting: Meeting, raw_text: str) -> dict:
     """Runs chunking -> embedding -> FAISS -> participants -> structured
-    extraction for a meeting whose raw text is already available (either
-    extracted from a document, or transcribed from audio/video).
-    Updates meeting.status to 'ready' or 'failed' as it goes. Returns a
-    dict of counts for the API response."""
+    extraction. Updates meeting.status to 'ready' or 'failed'. Raises
+    ValueError on failure so BOTH the sync and background callers can
+    catch the same exception type and handle it identically — this
+    fixes a real inconsistency where the sync path let embedding/FAISS
+    failures propagate as raw uncaught exceptions (chunks committed to
+    SQLite with no vectors, meeting stuck at "processing" forever),
+    while the background path already caught everything broadly."""
     if not raw_text.strip():
         meeting.status = "failed"
         db.commit()
@@ -86,14 +102,21 @@ def process_meeting_text(db: Session, meeting: Meeting, raw_text: str) -> dict:
     for row in chunk_rows:
         db.refresh(row)
 
-    vectors = get_embeddings([r.chunk_text for r in chunk_rows])
-    chunk_ids = [r.id for r in chunk_rows]
-    store = get_faiss_store()
-    store.add(chunk_ids, vectors)
+    # Embedding + FAISS indexing — this is the section that previously
+    # had NO error handling on the sync path. If get_embeddings() or
+    # store.add() throws here, the except block below catches it,
+    # marks the meeting failed, and re-raises as ValueError — instead
+    # of leaving committed chunks with no vectors and no status update.
+    try:
+        vectors = get_embeddings([r.chunk_text for r in chunk_rows])
+        chunk_ids = [r.id for r in chunk_rows]
+        store = get_faiss_store()
+        store.add(chunk_ids, vectors)
+    except Exception as e:
+        meeting.status = "failed"
+        db.commit()
+        raise ValueError(f"Embedding/indexing failed: {e}")
 
-    # Speaker auto-detection only fires for "transcript"-type text.
-    # Whisper output has no speaker labels, so this normally won't
-    # populate participants for audio/video — add them manually.
     if detected_type == "transcript":
         detected_speakers = detect_speakers(raw_text)
         existing_names = {
@@ -133,8 +156,7 @@ def process_meeting_text(db: Session, meeting: Meeting, raw_text: str) -> dict:
 
 
 def process_meeting_document(db: Session, meeting: Meeting, filepath: str) -> dict:
-    """Synchronous path for text/pdf/docx: extract text, then run the
-    shared pipeline. Raises on failure (caller should turn into a 400)."""
+    """Synchronous path for text/pdf/docx."""
     try:
         raw_text = extract_text(Path(filepath))
     except Exception as e:
@@ -146,9 +168,7 @@ def process_meeting_document(db: Session, meeting: Meeting, filepath: str) -> di
 
 
 def process_meeting_audio_background(meeting_id: int, filepath: str):
-    """Background path for audio/video: transcribe, then run the shared
-    pipeline. Uses its OWN database session since the original request's
-    session is already closed by the time a background task runs."""
+    """Background path for audio/video."""
     from app.db.database import SessionLocal
     db = SessionLocal()
     try:

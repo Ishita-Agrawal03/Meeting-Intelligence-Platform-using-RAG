@@ -1,12 +1,13 @@
-from pathlib import Path
+import asyncio
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.db.models import Project, Meeting, Chunk, Task, Decision, Participant
+from app.db.models import Project, Meeting, Task, Decision, Participant
 from app.schemas.meeting import ProjectCreate
 from app.services.pipeline import (
     save_uploaded_file,
+    delete_uploaded_file,
     is_audio_video,
     process_meeting_document,
     process_meeting_audio_background,
@@ -17,10 +18,6 @@ router = APIRouter(prefix="/projects", tags=["Projects"])
 
 @router.post("/")
 def create_or_get_project(payload: ProjectCreate, db: Session = Depends(get_db)):
-    """Idempotent: if a project with this exact name already exists,
-    returns it instead of erroring — matches 'pick an old project or
-    start a new one' with a single action, no separate existence check
-    needed on the frontend."""
     name = payload.name.strip()
     if not name:
         raise HTTPException(400, "Project name is required.")
@@ -51,7 +48,18 @@ def delete_project(project_id: int, db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
     if project is None:
         raise HTTPException(404, "Project not found")
-    db.delete(project)  # cascades to meetings -> chunks/tasks/decisions/participants
+
+    # The DB-level cascade (cascade="all, delete-orphan" on the
+    # relationship) removes the Meeting/Chunk/Task/Decision/Participant
+    # ROWS automatically. It does NOT touch files on disk — so without
+    # this loop, every uploaded file under this project would be
+    # orphaned on disk forever, with no way to find or clean it up
+    # once the DB rows referencing it are gone.
+    meetings = db.query(Meeting).filter(Meeting.project_id == project_id).all()
+    for meeting in meetings:
+        delete_uploaded_file(meeting.transcript_path)
+
+    db.delete(project)
     db.commit()
     return {"message": "Project deleted successfully"}
 
@@ -68,9 +76,6 @@ async def upload_to_project(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    """The primary upload path: creates a new meeting under this project
-    AND processes the file in one call, so the frontend never has to
-    separately 'create a meeting' before uploading to it."""
     project = db.query(Project).filter(Project.id == project_id).first()
     if project is None:
         raise HTTPException(404, "Project not found")
@@ -81,8 +86,12 @@ async def upload_to_project(
     db.refresh(meeting)
 
     file_bytes = await file.read()
+
+    # Same fix as meetings.py: offload the blocking save+retry to a
+    # thread so it doesn't stall the event loop for every concurrent
+    # request while this one retries a locked file.
     try:
-        filepath = save_uploaded_file(meeting.id, file.filename, file_bytes)
+        filepath = await asyncio.to_thread(save_uploaded_file, meeting.id, file.filename, file_bytes)
     except RuntimeError as e:
         meeting.status = "failed"
         db.commit()
@@ -142,8 +151,6 @@ def list_project_decisions(project_id: int, db: Session = Depends(get_db)):
 
 @router.get("/{project_id}/participants")
 def list_project_participants(project_id: int, db: Session = Depends(get_db)):
-    """Deduped across every meeting in the project — the same person
-    appearing in multiple meetings shows up once."""
     rows = (
         db.query(Participant)
         .join(Meeting, Participant.meeting_id == Meeting.id)

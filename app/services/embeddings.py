@@ -1,8 +1,6 @@
 from functools import lru_cache
 from sentence_transformers import SentenceTransformer
 
-# PINNED. Changing this makes every existing embedding incompatible
-# with new ones — you'd have to re-embed every chunk already stored.
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384  # must match the model above
 
@@ -12,15 +10,32 @@ def _get_model():
     return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
 
+def _validate_dim(vectors, expected_dim: int):
+    """Catches a real, silent failure mode: if EMBEDDING_MODEL_NAME
+    ever changes to a model with a different output size, or a bad
+    encode() call returns something malformed, this fails loudly here
+    instead of producing a cryptic FAISS dimension-mismatch error much
+    later, far from the actual cause."""
+    actual_dim = vectors.shape[-1]
+    if actual_dim != expected_dim:
+        raise ValueError(
+            f"Embedding model produced {actual_dim}-dim vectors, "
+            f"expected {expected_dim}. Did EMBEDDING_MODEL_NAME change "
+            f"without updating EMBEDDING_DIM?"
+        )
+
+
 def get_embedding(text: str):
-    """Returns a 1D float32 numpy array of length EMBEDDING_DIM."""
     model = _get_model()
     vector = model.encode(text)
-    return vector.astype("float32")
+    vector = vector.astype("float32")
+    _validate_dim(vector, EMBEDDING_DIM)
+    return vector
 
 
 def get_embeddings(texts: list[str]):
-    """Returns a 2D float32 numpy array, shape (len(texts), EMBEDDING_DIM)."""
     model = _get_model()
     vectors = model.encode(texts)
-    return vectors.astype("float32")
+    vectors = vectors.astype("float32")
+    _validate_dim(vectors, EMBEDDING_DIM)
+    return vectors

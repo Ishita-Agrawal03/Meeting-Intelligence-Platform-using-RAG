@@ -1,4 +1,4 @@
-from pathlib import Path
+import asyncio
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
@@ -7,6 +7,7 @@ from app.db.models import Meeting, Participant, Task, Decision
 from app.schemas.meeting import MeetingCreate
 from app.services.pipeline import (
     save_uploaded_file,
+    delete_uploaded_file,
     is_audio_video,
     process_meeting_document,
     process_meeting_audio_background,
@@ -15,10 +16,6 @@ from app.services.pipeline import (
 router = APIRouter(prefix="/meetings", tags=["Meetings"])
 
 
-# -----------------------------
-# Create Meeting (legacy path — kept for API completeness;
-# the primary flow is now POST /projects/{project_id}/upload)
-# -----------------------------
 @router.post("/")
 def create_meeting(meeting: MeetingCreate, db: Session = Depends(get_db)):
     new_meeting = Meeting(
@@ -57,15 +54,17 @@ def delete_meeting(meeting_id: int, db: Session = Depends(get_db)):
     meeting = db.query(Meeting).filter(Meeting.id == meeting_id).first()
     if meeting is None:
         raise HTTPException(status_code=404, detail="Meeting not found")
+
+    # Clean up the raw uploaded file from disk BEFORE deleting the DB
+    # row — previously the file was left behind forever with no
+    # cleanup lifecycle at all, since only the database row was removed.
+    delete_uploaded_file(meeting.transcript_path)
+
     db.delete(meeting)
     db.commit()
     return {"message": "Meeting deleted successfully"}
 
 
-# -----------------------------
-# Tasks / Decisions / Participants (global, all meetings —
-# project-scoped versions live in /projects/{id}/tasks etc.)
-# -----------------------------
 @router.get("/tasks/all")
 def list_tasks(owner: str = None, db: Session = Depends(get_db)):
     query = db.query(Task)
@@ -84,10 +83,6 @@ def get_participants(meeting_id: int, db: Session = Depends(get_db)):
     return db.query(Participant).filter(Participant.meeting_id == meeting_id).all()
 
 
-# -----------------------------
-# Upload Transcript (legacy path — kept for API completeness;
-# the primary flow is now POST /projects/{project_id}/upload)
-# -----------------------------
 @router.post("/{meeting_id}/upload")
 async def upload_transcript(
     meeting_id: int,
@@ -100,8 +95,15 @@ async def upload_transcript(
         raise HTTPException(status_code=404, detail="Meeting not found")
 
     file_bytes = await file.read()
+
+    # save_uploaded_file() is a blocking, synchronous function (it does
+    # real disk I/O and a time.sleep() retry loop). Calling it directly
+    # inside an `async def` route would block the entire event loop —
+    # stalling EVERY other concurrent request, not just this one — for
+    # up to 1.5s if a retry is needed. asyncio.to_thread() runs it on a
+    # separate thread instead, so the event loop stays free.
     try:
-        filepath = save_uploaded_file(meeting.id, file.filename, file_bytes)
+        filepath = await asyncio.to_thread(save_uploaded_file, meeting.id, file.filename, file_bytes)
     except RuntimeError as e:
         meeting.status = "failed"
         db.commit()
